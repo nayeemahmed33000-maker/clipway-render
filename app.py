@@ -30,6 +30,11 @@ FORMAT_PREFS = [
     "bestvideo[height<=1080]+bestaudio/best",
 ]
 
+# YouTube bot-gates the default web player client from datacenter IPs
+# ("Sign in to confirm you're not a bot"). The android/tv Innertube
+# clients usually still return working streams, so try them first.
+PLAYER_CLIENTS = ["android", "tv", "web"]
+
 # NOTE: commas inside min() MUST be backslash-escaped (\,) or ffmpeg's
 # filtergraph parser splits the filter there.
 VIDEO_FILTER = "crop=min(iw\\,ih*9/16):min(ih\\,iw*16/9),scale=1080:1920:flags=lanczos"
@@ -52,18 +57,41 @@ def _err(status: int, msg: str) -> JSONResponse:
 
 def _get_stream_urls(video_id: str):
     url = f"https://www.youtube.com/watch?v={video_id}"
-    for fmt in FORMAT_PREFS:
-        p = subprocess.run(
-            ["yt-dlp", "--get-url", "-f", fmt, "--js-runtimes", "node", url],
-            capture_output=True, text=True, timeout=120,
-        )
-        urls = [ln.strip() for ln in p.stdout.splitlines()
-                if ln.strip().startswith("http")]
-        if len(urls) >= 2:
-            return urls[0], urls[1]
-        if len(urls) == 1:
-            return urls[0], None
+    for client in PLAYER_CLIENTS:
+        for fmt in FORMAT_PREFS:
+            p = subprocess.run(
+                ["yt-dlp", "--get-url", "-f", fmt, "--js-runtimes", "node",
+                 "--extractor-args", f"youtube:player_client={client}", url],
+                capture_output=True, text=True, timeout=120,
+            )
+            urls = [ln.strip() for ln in p.stdout.splitlines()
+                    if ln.strip().startswith("http")]
+            if len(urls) >= 2:
+                return urls[0], urls[1]
+            if len(urls) == 1:
+                return urls[0], None
     return None
+
+
+def _download_source(video_id: str, src_tmpl: str):
+    """Full-file download fallback, trying each player client in turn.
+    Returns the downloaded Path, or None if every client failed."""
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    last_err = None
+    for client in PLAYER_CLIENTS:
+        p = subprocess.run(
+            ["yt-dlp", "-f", FORMAT_PREFS[0], "--js-runtimes", "node",
+             "--extractor-args", f"youtube:player_client={client}",
+             "--merge-output-format", "mp4", "-o", src_tmpl, url],
+            capture_output=True, text=True, timeout=540,
+        )
+        src = next((f for f in Path(src_tmpl).parent.glob("source.*")
+                    if not f.name.endswith((".part", ".ytdl", ".temp"))), None)
+        if p.returncode == 0 and src is not None:
+            return src
+        last_err = (p.stderr or p.stdout or "")[-300:]
+    raise subprocess.CalledProcessError(1, "yt-dlp",
+                                        output=last_err or "all player clients failed")
 
 
 def _ffmpeg_cut(inputs, start: int, duration: int, out_path: Path):
@@ -126,13 +154,7 @@ async def render(req: Request):
                     _ffmpeg_cut(inputs, start, duration, out_path)
                 else:
                     src_tmpl = str(Path(td) / "source.%(ext)s")
-                    subprocess.run(
-                        ["yt-dlp", "-f", FORMAT_PREFS[0], "--js-runtimes", "node",
-                         "--merge-output-format", "mp4", "-o", src_tmpl,
-                         f"https://www.youtube.com/watch?v={video_id}"],
-                        check=True, capture_output=True, text=True, timeout=540,
-                    )
-                    src = next(Path(td).glob("source.*"), None)
+                    src = _download_source(video_id, src_tmpl)
                     if src is None:
                         return _err(502, "yt-dlp download produced no file")
                     _ffmpeg_cut([str(src)], start, duration, out_path)
