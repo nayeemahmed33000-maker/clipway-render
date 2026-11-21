@@ -11,7 +11,9 @@ Endpoints:
 Runs on HF Spaces port 7860 (see README.md front-matter, sdk: docker).
 """
 
+import base64
 import json
+import os
 import re
 import subprocess
 import tempfile
@@ -39,6 +41,28 @@ PLAYER_CLIENTS = ["android", "tv", "web"]
 # filtergraph parser splits the filter there.
 VIDEO_FILTER = "crop=min(iw\\,ih*9/16):min(ih\\,iw*16/9),scale=1080:1920:flags=lanczos"
 
+# YouTube cookies (optional, to unblock the "Sign in to confirm you're not
+# a bot" gate on datacenter IPs). Set YT_COOKIES_B64 (base64 Netscape
+# cookies.txt) or YT_COOKIES (raw Netscape text) as a Railway variable.
+# Cookies are NEVER committed to the repo — they live only in the server env.
+COOKIES_PATH = None
+for _env_name in ("YT_COOKIES_B64", "YT_COOKIES"):
+    _raw = os.environ.get(_env_name)
+    if _raw:
+        try:
+            _data = (base64.b64decode(_raw).decode("utf-8", "replace")
+                     if _env_name.endswith("B64") else _raw)
+            COOKIES_PATH = "/tmp/yt-cookies.txt"
+            Path(COOKIES_PATH).write_text(_data)
+        except Exception:
+            COOKIES_PATH = None
+        break
+
+
+def _cookie_args():
+    return ["--cookies", COOKIES_PATH] if COOKIES_PATH else []
+
+
 # Free CPU Space has 2 vCPU — serialize renders so they don't fight each other.
 _RENDER_LOCK = threading.Lock()
 
@@ -61,7 +85,8 @@ def _get_stream_urls(video_id: str):
         for fmt in FORMAT_PREFS:
             p = subprocess.run(
                 ["yt-dlp", "--get-url", "-f", fmt, "--js-runtimes", "node",
-                 "--extractor-args", f"youtube:player_client={client}", url],
+                 "--extractor-args", f"youtube:player_client={client}",
+                 *_cookie_args(), url],
                 capture_output=True, text=True, timeout=120,
             )
             urls = [ln.strip() for ln in p.stdout.splitlines()
@@ -82,6 +107,7 @@ def _download_source(video_id: str, src_tmpl: str):
         p = subprocess.run(
             ["yt-dlp", "-f", FORMAT_PREFS[0], "--js-runtimes", "node",
              "--extractor-args", f"youtube:player_client={client}",
+             *_cookie_args(),
              "--merge-output-format", "mp4", "-o", src_tmpl, url],
             capture_output=True, text=True, timeout=540,
         )
@@ -114,7 +140,8 @@ def _ffmpeg_cut(inputs, start: int, duration: int, out_path: Path):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "clipway-render", "maxClipSeconds": MAX_CLIP_SECONDS}
+    return {"ok": True, "service": "clipway-render", "maxClipSeconds": MAX_CLIP_SECONDS,
+            "cookies_configured": COOKIES_PATH is not None}
 
 
 @app.get("/")
